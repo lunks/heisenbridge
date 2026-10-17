@@ -98,6 +98,7 @@ class NetworkRoom(Room):
     pills_length: int
     pills_ignore: list
     autoquery: bool
+    double_puppet: bool
     color: bool
     tls_cert: str
     rejoin_invite: bool
@@ -137,6 +138,7 @@ class NetworkRoom(Room):
         self.pills_length = 2
         self.pills_ignore = []
         self.autoquery = True
+        self.double_puppet = False
         self.color = True
         self.allow_ctcp = False
         self.tls_cert = None
@@ -434,6 +436,19 @@ class NetworkRoom(Room):
         cmd.set_defaults(enabled=None)
         self.commands.register(cmd, self.cmd_autoquery)
 
+        cmd = CommandParser(
+            prog="DOUBLEPUPPET",
+            description="show messages your nick sends from other IRC clients as your Matrix user",
+            epilog=(
+                "Requires the appservice registration to have a non-exclusive users namespace matching your"
+                " Matrix ID.\n"
+            ),
+        )
+        cmd.add_argument("--enable", dest="enabled", action="store_true", help="Enable double puppeting")
+        cmd.add_argument("--disable", dest="enabled", action="store_false", help="Disable double puppeting")
+        cmd.set_defaults(enabled=None)
+        self.commands.register(cmd, self.cmd_double_puppet)
+
         cmd = CommandParser(prog="WHOIS", description="send a WHOIS(IS) command")
         cmd.add_argument("nick", help="target nick")
         self.commands.register(cmd, self.cmd_whois)
@@ -572,6 +587,9 @@ class NetworkRoom(Room):
         if "autoquery" in config:
             self.autoquery = config["autoquery"]
 
+        if "double_puppet" in config:
+            self.double_puppet = config["double_puppet"]
+
         if "color" in config:
             self.autoquery = config["color"]
 
@@ -610,6 +628,7 @@ class NetworkRoom(Room):
             "pills_length": self.pills_length,
             "pills_ignore": self.pills_ignore,
             "autoquery": self.autoquery,
+            "double_puppet": self.double_puppet,
             "color": self.color,
             "rejoin_invite": self.rejoin_invite,
             "rejoin_kick": self.rejoin_kick,
@@ -1092,6 +1111,13 @@ class NetworkRoom(Room):
             await self.save()
 
         self.send_notice(f"Autoquery is {'enabled' if self.autoquery else 'disabled'}")
+
+    async def cmd_double_puppet(self, args) -> None:
+        if args.enabled is not None:
+            self.double_puppet = args.enabled
+            await self.save()
+
+        self.send_notice(f"Double puppeting is {'enabled' if self.double_puppet else 'disabled'}")
 
     async def cmd_rejoin(self, args) -> None:
         if args.invite is not None:

@@ -375,6 +375,7 @@ class PrivateRoom(Room):
     use_reacts = False
     force_forward = False
     prefix_all = False
+    allow_double_puppet = True
 
     commands: CommandManager
 
@@ -549,11 +550,28 @@ class PrivateRoom(Room):
         formatted=None,
         fallback_html: Optional[str] = None,
         forward=False,
+        double_puppet: bool = False,
     ):
         if (self.force_forward or forward or self.network.forward) and user_id is None:
             self.network.send_notice(text=f"{self.name}: {text}", formatted=formatted, fallback_html=fallback_html)
         else:
-            super().send_notice(text=text, user_id=user_id, formatted=formatted, fallback_html=fallback_html)
+            super().send_notice(
+                text=text,
+                user_id=user_id,
+                formatted=formatted,
+                fallback_html=fallback_html,
+                double_puppet=double_puppet,
+            )
+
+    def can_double_puppet(self) -> bool:
+        # show our own nick's messages from other clients as the Matrix owner
+        return (
+            self.allow_double_puppet
+            and self.network is not None
+            and self.network.double_puppet
+            and self.lazy_members is not None
+            and self.user_id in self.members
+        )
 
     def send_notice_html(self, text: str, user_id: Optional[str] = None, forward=False) -> None:
         if (self.force_forward or forward or self.network.forward) and user_id is None:
@@ -602,6 +620,10 @@ class PrivateRoom(Room):
                     return
 
         if event.source.nick == self.network.conn.real_nickname:
+            if self.can_double_puppet():
+                self.send_message(plain, self.user_id, formatted=formatted, double_puppet=True)
+                return
+
             source_irc_user_id = self.serv.irc_user_id(self.network.name, event.source.nick)
 
             if self.lazy_members is None:
@@ -650,6 +672,10 @@ class PrivateRoom(Room):
         (plain, formatted) = parse_irc_formatting(event.arguments[0])
 
         if event.source.nick == self.network.conn.real_nickname:
+            if self.can_double_puppet():
+                self.send_notice(plain, self.user_id, formatted=formatted, double_puppet=True)
+                return
+
             self.send_notice(f"You noticed: {plain}", formatted=(f"You noticed: {formatted}" if formatted else None))
             return
 
@@ -687,7 +713,10 @@ class PrivateRoom(Room):
             (plain, formatted) = parse_irc_formatting(event.arguments[1])
 
             if event.source.nick == self.network.conn.real_nickname:
-                self.send_emote(f"(you) {plain}")
+                if self.can_double_puppet():
+                    self.send_emote(plain, self.user_id, double_puppet=True)
+                else:
+                    self.send_emote(f"(you) {plain}")
                 return
 
             self.send_emote(

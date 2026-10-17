@@ -16,6 +16,18 @@ from heisenbridge.event_queue import EventQueue
 from heisenbridge.parser import IRCMatrixParser
 
 
+# content key marking events sent as the room owner for messages the owner's IRC nick
+# sent from another client, these must never be relayed back to IRC
+DOUBLE_PUPPET_KEY = "fi.heisenbridge.double_puppet"
+
+
+def is_double_puppeted(event) -> bool:
+    content = getattr(event, "content", None)
+    if content is None or not hasattr(content, "get"):
+        return False
+    return bool(content.get(DOUBLE_PUPPET_KEY))
+
+
 class RoomInvalidError(Exception):
     pass
 
@@ -94,6 +106,10 @@ class Room(ABC):
         self._mx_handlers[type].append(func)
 
     async def on_mx_event(self, event: dict) -> None:
+        # our own double puppeted events coming back from the homeserver
+        if is_double_puppeted(event):
+            return
+
         handlers = self._mx_handlers.get(str(event.type), [self._on_mx_unhandled_event])
 
         for handler in handlers:
@@ -278,7 +294,12 @@ class Room(ABC):
 
     # send message to mx user (may be puppeted)
     def send_message(
-        self, text: str, user_id: Optional[str] = None, formatted=None, fallback_html: Optional[str] = None
+        self,
+        text: str,
+        user_id: Optional[str] = None,
+        formatted=None,
+        fallback_html: Optional[str] = None,
+        double_puppet: bool = False,
     ) -> None:
         if formatted:
             event = {
@@ -303,10 +324,19 @@ class Room(ABC):
                 "fallback_html": fallback_html,
             }
 
+        if double_puppet:
+            event["content"][DOUBLE_PUPPET_KEY] = True
+
         self._queue.enqueue(event)
 
     # send emote to mx user (may be puppeted)
-    def send_emote(self, text: str, user_id: Optional[str] = None, fallback_html: Optional[str] = None) -> None:
+    def send_emote(
+        self,
+        text: str,
+        user_id: Optional[str] = None,
+        fallback_html: Optional[str] = None,
+        double_puppet: bool = False,
+    ) -> None:
         event = {
             "type": "m.room.message",
             "content": {
@@ -317,11 +347,19 @@ class Room(ABC):
             "fallback_html": fallback_html,
         }
 
+        if double_puppet:
+            event["content"][DOUBLE_PUPPET_KEY] = True
+
         self._queue.enqueue(event)
 
     # send notice to mx user (may be puppeted)
     def send_notice(
-        self, text: str, user_id: Optional[str] = None, formatted=None, fallback_html: Optional[str] = None
+        self,
+        text: str,
+        user_id: Optional[str] = None,
+        formatted=None,
+        fallback_html: Optional[str] = None,
+        double_puppet: bool = False,
     ) -> None:
         if formatted:
             event = {
@@ -345,6 +383,9 @@ class Room(ABC):
                 "user_id": user_id,
                 "fallback_html": fallback_html,
             }
+
+        if double_puppet:
+            event["content"][DOUBLE_PUPPET_KEY] = True
 
         self._queue.enqueue(event)
 

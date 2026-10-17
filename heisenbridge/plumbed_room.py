@@ -52,6 +52,7 @@ class PlumbedRoom(ChannelRoom):
     use_zwsp = False
     allow_notice = False
     force_forward = True
+    allow_double_puppet = False
     topic_sync = None
     relaytag = "m"
 

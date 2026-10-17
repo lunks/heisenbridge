@@ -520,6 +520,10 @@ class BridgeAppService(AppService):
             if x["regex"].split(":")[0] != f"@{self.registration['sender_localpart']}"
         ]
 
+        # non-exclusive namespaces are for double puppeting real users, not puppets
+        if len(ns_users) > 1:
+            ns_users = [x for x in ns_users if x.get("exclusive")]
+
         if len(ns_users) != 1:
             print("A single user namespace is required for puppets in the registration file.")
             sys.exit(1)
