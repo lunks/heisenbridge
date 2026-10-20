@@ -817,6 +817,30 @@ class NetworkRoom(Room):
             self.conn.disconnect()
 
     @connected
+    async def _cap_ls_302(self) -> list:
+        """CAP LS 302, collecting every line of the (possibly multiline) reply, values stripped."""
+        done = asyncio.Event()
+        caps = []
+
+        def on_cap(conn, event):
+            if event.arguments and event.arguments[0] == "LS":
+                caps.extend(event.arguments[-1].split())
+                if not (len(event.arguments) > 2 and event.arguments[1] == "*"):
+                    done.set()
+            return "NO MORE"
+
+        conn = self.conn
+        conn.add_global_handler("cap", on_cap, -100)
+        try:
+            conn.cap("LS", "302")
+            self.caps_task = asyncio.ensure_future(asyncio.wait_for(done.wait(), 10))
+            await self.caps_task
+        finally:
+            self.caps_task = None
+            conn.remove_global_handler("cap", on_cap)
+
+        return [c.split("=", 1)[0] for c in caps]
+
     async def cmd_reconnect(self, args) -> None:
         await self.cmd_disconnect(Namespace())
         await self.cmd_connect(Namespace())
@@ -1590,22 +1614,17 @@ class NetworkRoom(Room):
                     self.send_notice(f"Capabilities wanted: {', '.join(caps_req)}")
 
                     try:
-                        # capabilities with values (draft/authtoken) are only listed to CAP LS 302 clients
                         if self.filehost:
-                            self.conn.cap("LS", "302")
+                            # capabilities with values (draft/authtoken) are only listed to CAP LS 302 clients
+                            self.caps_supported = await self._cap_ls_302()
+
+                            if self.conn is None:
+                                return
+
+                            self.send_notice(f"Capabilities supported by server: {', '.join(self.caps_supported)}")
+                            caps_req = [cap for cap in caps_req if cap in self.caps_supported]
                         else:
                             self.conn.cap("LS")
-                        self.caps_task = asyncio.ensure_future(self.conn.expect("cap", 10))
-                        (connection, event) = await self.caps_task
-                        self.caps_task = None
-
-                        if self.conn is None:
-                            return
-
-                        # a CAP LS 302 reply can span several lines, "CAP * LS * :caps" means more follow
-                        ls_caps = []
-                        while len(event.arguments) > 2 and event.arguments[0] == "LS" and event.arguments[1] == "*":
-                            ls_caps += event.arguments[2].split()
                             self.caps_task = asyncio.ensure_future(self.conn.expect("cap", 10))
                             (connection, event) = await self.caps_task
                             self.caps_task = None
@@ -1613,12 +1632,12 @@ class NetworkRoom(Room):
                             if self.conn is None:
                                 return
 
-                        if len(event.arguments) > 1 and event.arguments[0] == "LS":
-                            self.caps_supported = [c.split("=", 1)[0] for c in ls_caps + event.arguments[1].split()]
-                            self.send_notice(f"Capabilities supported by server: {', '.join(self.caps_supported)}")
+                            if len(event.arguments) > 1 and event.arguments[0] == "LS":
+                                self.caps_supported = event.arguments[1].split()
+                                self.send_notice(f"Capabilities supported by server: {', '.join(self.caps_supported)}")
 
-                            # filter all unsupported caps away
-                            caps_req = [cap for cap in caps_req if cap in self.caps_supported]
+                                # filter all unsupported caps away
+                                caps_req = [cap for cap in caps_req if cap in self.caps_supported]
 
                         if caps_req:
                             self.send_notice(f"Capabilities requested: {', '.join(caps_req)}")
