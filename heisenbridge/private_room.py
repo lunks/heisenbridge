@@ -848,6 +848,8 @@ class PrivateRoom(Room):
         if v3 is not None and self.allow_v3 and kind in ("privmsg", "action") and v3.tags_active():
             tags = v3.outgoing_tags(self, event, first)
             if tags:
+                if "label" in tags and self.name.lower() == self.network.conn.real_nickname.lower():
+                    v3.note_self_sent(message, v3.pending_labels.get(tags["label"]))
                 text = message if kind == "privmsg" else f"\001ACTION {message}\001"
                 self.network.conn.send_tagged(tags, "PRIVMSG", self.name, ":" + text)
                 return

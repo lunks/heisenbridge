@@ -192,6 +192,8 @@ class IRCv3:
         self.token_waiter: Optional[asyncio.Future] = None
         self.token_chunks: List[str] = []
         self.token_lock = asyncio.Lock()
+        # lines we sent to our own nick: the server delivers them back as an ordinary message too
+        self.self_sent: list = []
 
     # ---- capabilities -------------------------------------------------------------------------
 
@@ -235,6 +237,7 @@ class IRCv3:
         self.conn_id += 1
         self.batches = {}
         self.pending_labels = OrderedDict()
+        self.self_sent = []
         for fut in (self.history_waiter, self.token_waiter):
             if fut is not None and not fut.done():
                 fut.cancel()
@@ -340,6 +343,9 @@ class IRCv3:
             event.meta = None
             return None
 
+        if self._is_self_delivery(conn, event, room, meta):
+            return "NO MORE"
+
         replay = getattr(event, "v3_replay", False)
 
         if not replay and room.backfilling and event.type != "tagmsg":
@@ -358,6 +364,30 @@ class IRCv3:
             meta.ts = None
 
         return None
+
+    def note_self_sent(self, text: str, event_id: Optional[str]) -> None:
+        self.self_sent.append((text, event_id, time.monotonic()))
+        del self.self_sent[:-20]
+
+    def _is_self_delivery(self, conn, event, room, meta: MsgMeta) -> bool:
+        """The copy of a line we sent to our own nick that the server delivers to us besides the echo."""
+        if not self.self_sent or event.source is None or event.source.nick != conn.real_nickname:
+            return False
+        if event.target != conn.real_nickname or event.type not in ("privmsg", "privnotice", "ctcp"):
+            return False
+        text = event.arguments[1] if event.type == "ctcp" and len(event.arguments) > 1 else event.arguments[0]
+        now = time.monotonic()
+        self.self_sent[:] = [e for e in self.self_sent if now - e[2] < 30]
+        for i, (sent, event_id, _) in enumerate(self.self_sent):
+            if sent == text:
+                del self.self_sent[i]
+                if meta.msgid:
+                    room.index.add_seen(meta.msgid)
+                    if event_id:
+                        room.index.link(meta.msgid, event_id)
+                    self.advance_cursor(room, meta)
+                return True
+        return False
 
     @staticmethod
     def _is_chat(event) -> bool:

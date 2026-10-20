@@ -502,6 +502,26 @@ def test_matrix_send_is_labeled_and_its_echo_is_not_posted_back():
     assert h.leaks == []
 
 
+def test_line_sent_to_our_own_nick_is_not_posted_twice_whatever_arrives_first():
+    async def go(echo_first):
+        h = Harness(echo=True, double_puppet=True, caps_enabled=ECHO_CAPS, name="me")
+        ev = matrix_event({"msgtype": "m.text", "body": "note to self"})
+        h.room._irc_emit(h.conn.privmsg, "note to self", ev, True)
+        label = h.sent[0].split(" ")[0][1:]
+        echo = f"@{label};msgid=x1;time={iso(T0)} :me!u@h PRIVMSG me :note to self"
+        delivery = f"@msgid=x1;time={iso(T0)} :me!u@h PRIVMSG me :note to self"
+        for line in (echo, delivery) if echo_first else (delivery, echo):
+            h.feed(line)
+        # something else typed in another client is still shown
+        h.feed(f"@msgid=x2;time={iso(T0)} :me!u@h PRIVMSG me :from the web")
+        return h
+
+    for echo_first in (True, False):
+        h = run(go(echo_first))
+        assert [e["content"]["body"] for e in h.posted] == ["from the web"]
+        assert h.room.index.event_for("x1") == "$mx1"
+
+
 def test_action_from_matrix_is_labeled_ctcp():
     async def go():
         h = Harness(echo=True, caps_enabled=ECHO_CAPS)
