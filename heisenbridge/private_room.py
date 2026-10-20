@@ -959,6 +959,10 @@ class PrivateRoom(Room):
             await self._send_message(event, self.network.conn.action)
         elif str(event.content.msgtype) in ["m.image", "m.file", "m.audio", "m.video"]:
             url = await self._upload_to_filehost(event)
+            if not url and not getattr(self.serv, "media_endpoint", None):
+                # no way to link Matrix media either (no media URL configured), say so instead of failing silently
+                self.send_notice("Could not send the file to IRC: no file host upload and no media URL is configured.")
+                return
             if url:
                 if event.content.filename and event.content.filename != event.content.body:
                     new_body = url + "\n" + event.content.body
@@ -1039,6 +1043,8 @@ class PrivateRoom(Room):
         tags = {"+draft/react": key, "+draft/reply": msgid}
         if v3.echo_active:
             tags["label"] = v3.register_label(None)
+            if self.name.lower() == conn.real_nickname.lower():
+                v3.note_self_sent(("tag", key, msgid), None)
         conn.send_tagged(tags, "TAGMSG", self.name)
 
         self.sent_reactions[str(event.event_id)] = (msgid, key)
@@ -1055,6 +1061,8 @@ class PrivateRoom(Room):
                 tags = {"+draft/unreact": key, "+draft/reply": msgid}
                 if v3.echo_active:
                     tags["label"] = v3.register_label(None)
+                    if self.name.lower() == conn.real_nickname.lower():
+                        v3.note_self_sent(("tag", key, msgid), None)
                 conn.send_tagged(tags, "TAGMSG", self.name)
             return
 

@@ -522,6 +522,29 @@ def test_line_sent_to_our_own_nick_is_not_posted_twice_whatever_arrives_first():
         assert h.room.index.event_for("x1") == "$mx1"
 
 
+def test_reaction_sent_to_our_own_nick_is_not_reflected_back():
+    async def go():
+        h = Harness(replies=True, echo=True, caps_enabled=ECHO_CAPS, double_puppet=True, name="me")
+        h.room.index.link("mid1", "$known")
+        ev = Event.deserialize(
+            {
+                "type": "m.reaction",
+                "room_id": "!room:example.com",
+                "event_id": "$r1",
+                "sender": OWNER,
+                "origin_server_ts": 0,
+                "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$known", "key": "x"}},
+            }
+        )
+        await h.room.on_mx_reaction(ev)
+        label = h.sent[0].split(" ")[0][1:]
+        h.feed(f"@{label};msgid=t1;+draft/react=x;+draft/reply=mid1 :me!u@h TAGMSG me")
+        h.feed("@msgid=t1;+draft/react=x;+draft/reply=mid1 :me!u@h TAGMSG me")
+        return h
+
+    assert run(go()).room._queue.events == []
+
+
 def test_action_from_matrix_is_labeled_ctcp():
     async def go():
         h = Harness(echo=True, caps_enabled=ECHO_CAPS)
