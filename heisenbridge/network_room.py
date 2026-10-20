@@ -1590,7 +1590,11 @@ class NetworkRoom(Room):
                     self.send_notice(f"Capabilities wanted: {', '.join(caps_req)}")
 
                     try:
-                        self.conn.cap("LS")
+                        # capabilities with values (draft/authtoken) are only listed to CAP LS 302 clients
+                        if self.filehost:
+                            self.conn.cap("LS", "302")
+                        else:
+                            self.conn.cap("LS")
                         self.caps_task = asyncio.ensure_future(self.conn.expect("cap", 10))
                         (connection, event) = await self.caps_task
                         self.caps_task = None
@@ -1598,8 +1602,19 @@ class NetworkRoom(Room):
                         if self.conn is None:
                             return
 
+                        # a CAP LS 302 reply can span several lines, "CAP * LS * :caps" means more follow
+                        ls_caps = []
+                        while len(event.arguments) > 2 and event.arguments[0] == "LS" and event.arguments[1] == "*":
+                            ls_caps += event.arguments[2].split()
+                            self.caps_task = asyncio.ensure_future(self.conn.expect("cap", 10))
+                            (connection, event) = await self.caps_task
+                            self.caps_task = None
+
+                            if self.conn is None:
+                                return
+
                         if len(event.arguments) > 1 and event.arguments[0] == "LS":
-                            self.caps_supported = event.arguments[1].split()
+                            self.caps_supported = [c.split("=", 1)[0] for c in ls_caps + event.arguments[1].split()]
                             self.send_notice(f"Capabilities supported by server: {', '.join(self.caps_supported)}")
 
                             # filter all unsupported caps away
