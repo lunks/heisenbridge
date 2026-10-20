@@ -221,7 +221,8 @@ class HeisenConnection(AioConnection):
     def send_raw(self, string, priority=0, tag=None):
         self._queue.put_nowait((priority, string, tag))
 
-    def send_items(self, *items):
+    @staticmethod
+    def _priority_and_tag(items):
         priority = 0
         tag = None
         if items[0] == "NOTICE":
@@ -236,10 +237,23 @@ class HeisenConnection(AioConnection):
             priority = -1
 
         # tag with target to dequeue with filter
-        if tag is None and items[0] in ["NOTICE", "PRIVMSG", "MODE", "JOIN", "PART", "KICK"]:
+        if items[0] in ["NOTICE", "PRIVMSG", "MODE", "JOIN", "PART", "KICK"]:
             tag = items[1].lower()
 
+        return priority, tag
+
+    def send_items(self, *items):
+        priority, tag = self._priority_and_tag(items)
         self.send_raw(" ".join(filter(None, items)), priority, tag)
+
+    def send_tagged(self, tags, *items):
+        """Like send_items with IRCv3 message tags, `tags` is a dict (see ircv3.build_tags)."""
+        from heisenbridge.ircv3 import build_tags
+
+        priority, tag = self._priority_and_tag(items)
+        prefix = build_tags(tags)
+        line = " ".join(filter(None, items))
+        self.send_raw(f"{prefix} {line}" if prefix else line, priority, tag)
 
     def remove_tag(self, tag) -> int:
         return self._queue.remove_tag(tag)

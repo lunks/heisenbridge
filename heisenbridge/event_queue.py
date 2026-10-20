@@ -86,6 +86,9 @@ class EventQueue:
                 and prev["content"]["msgtype"] == event["content"]["msgtype"]
                 and prev_formatted == cur_formatted
                 and prev_len < 64_000  # a single IRC event can't overflow with this
+                # events with an IRC identity (msgid, reply, timestamp) stay separate
+                and "meta" not in prev
+                and "meta" not in event
             ):
                 prev["content"]["body"] += "\n" + event["content"]["body"]
                 if cur_formatted:

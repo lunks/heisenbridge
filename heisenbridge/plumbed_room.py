@@ -53,6 +53,8 @@ class PlumbedRoom(ChannelRoom):
     allow_notice = False
     force_forward = True
     allow_double_puppet = False
+    allow_v3 = False
+    allow_backfill = False
     topic_sync = None
     relaytag = "m"
 

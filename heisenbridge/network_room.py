@@ -30,6 +30,7 @@ from heisenbridge.command_parse import CommandManager
 from heisenbridge.command_parse import CommandParser
 from heisenbridge.command_parse import CommandParserError
 from heisenbridge.irc import HeisenReactor
+from heisenbridge.ircv3 import IRCv3
 from heisenbridge.plumbed_room import PlumbedRoom
 from heisenbridge.private_room import parse_irc_formatting
 from heisenbridge.private_room import PrivateRoom
@@ -99,6 +100,12 @@ class NetworkRoom(Room):
     pills_ignore: list
     autoquery: bool
     double_puppet: bool
+    backfill: bool
+    backfill_max: int
+    backfill_max_age: int
+    replies: bool
+    echo: bool
+    filehost: bool
     color: bool
     tls_cert: str
     rejoin_invite: bool
@@ -139,6 +146,12 @@ class NetworkRoom(Room):
         self.pills_ignore = []
         self.autoquery = True
         self.double_puppet = False
+        self.backfill = False
+        self.backfill_max = 200
+        self.backfill_max_age = 24  # hours
+        self.replies = False
+        self.echo = False
+        self.filehost = False
         self.color = True
         self.allow_ctcp = False
         self.tls_cert = None
@@ -167,6 +180,7 @@ class NetworkRoom(Room):
         self.caps_supported = []
         self.caps_enabled = []
         self.caps_task = None
+        self.v3 = IRCv3(self)
 
         cmd = CommandParser(
             prog="NICK",
@@ -449,6 +463,61 @@ class NetworkRoom(Room):
         cmd.set_defaults(enabled=None)
         self.commands.register(cmd, self.cmd_double_puppet)
 
+        cmd = CommandParser(
+            prog="BACKFILL",
+            description="post channel messages missed while disconnected, from IRC chat history",
+            epilog=(
+                "Needs server-time, batch and draft/chathistory. Takes effect on the next connect (RECONNECT).\n"
+                "Messages are posted with their original time. At most MAX messages newer than MAX-AGE hours are"
+                " posted per channel and connect, a notice tells how many were skipped.\n"
+            ),
+        )
+        cmd.add_argument("--enable", dest="enabled", action="store_true", help="Enable backfill")
+        cmd.add_argument("--disable", dest="enabled", action="store_false", help="Disable backfill")
+        cmd.add_argument("--max", type=int, help="maximum messages per channel and connect")
+        cmd.add_argument("--max-age", type=int, help="maximum age in hours")
+        cmd.set_defaults(enabled=None)
+        self.commands.register(cmd, self.cmd_backfill)
+
+        cmd = CommandParser(
+            prog="REPLIES",
+            description="bridge IRC replies and reactions (+draft/reply, +draft/react) to and from Matrix",
+            epilog=(
+                "Takes effect on the next connect (RECONNECT). Matrix replies and reactions are tagged only when the"
+                " IRC message they refer to is known. Use ECHO too so your own Matrix messages can be referred to.\n"
+            ),
+        )
+        cmd.add_argument("--enable", dest="enabled", action="store_true", help="Enable replies and reactions")
+        cmd.add_argument("--disable", dest="enabled", action="store_false", help="Disable replies and reactions")
+        cmd.set_defaults(enabled=None)
+        self.commands.register(cmd, self.cmd_replies)
+
+        cmd = CommandParser(
+            prog="ECHO",
+            description="learn the message ids of your own messages with echo-message",
+            epilog=(
+                "Takes effect on the next connect (RECONNECT). Messages sent from Matrix are labeled so their echo"
+                " is never posted back to the room or sent again.\n"
+            ),
+        )
+        cmd.add_argument("--enable", dest="enabled", action="store_true", help="Enable echo-message")
+        cmd.add_argument("--disable", dest="enabled", action="store_false", help="Disable echo-message")
+        cmd.set_defaults(enabled=None)
+        self.commands.register(cmd, self.cmd_echo)
+
+        cmd = CommandParser(
+            prog="FILEHOST",
+            description="upload Matrix media to the network's file host instead of linking the Matrix media",
+            epilog=(
+                "Needs the obby.world/FILEHOST server feature and draft/authtoken. Takes effect on the next connect"
+                " (RECONNECT). Falls back to the Matrix link when the upload fails.\n"
+            ),
+        )
+        cmd.add_argument("--enable", dest="enabled", action="store_true", help="Enable file host uploads")
+        cmd.add_argument("--disable", dest="enabled", action="store_false", help="Disable file host uploads")
+        cmd.set_defaults(enabled=None)
+        self.commands.register(cmd, self.cmd_filehost)
+
         cmd = CommandParser(prog="WHOIS", description="send a WHOIS(IS) command")
         cmd.add_argument("nick", help="target nick")
         self.commands.register(cmd, self.cmd_whois)
@@ -590,6 +659,10 @@ class NetworkRoom(Room):
         if "double_puppet" in config:
             self.double_puppet = config["double_puppet"]
 
+        for key in ("backfill", "backfill_max", "backfill_max_age", "replies", "echo", "filehost"):
+            if key in config:
+                setattr(self, key, config[key])
+
         if "color" in config:
             self.autoquery = config["color"]
 
@@ -629,6 +702,12 @@ class NetworkRoom(Room):
             "pills_ignore": self.pills_ignore,
             "autoquery": self.autoquery,
             "double_puppet": self.double_puppet,
+            "backfill": self.backfill,
+            "backfill_max": self.backfill_max,
+            "backfill_max_age": self.backfill_max_age,
+            "replies": self.replies,
+            "echo": self.echo,
+            "filehost": self.filehost,
             "color": self.color,
             "rejoin_invite": self.rejoin_invite,
             "rejoin_kick": self.rejoin_kick,
@@ -1119,6 +1198,51 @@ class NetworkRoom(Room):
 
         self.send_notice(f"Double puppeting is {'enabled' if self.double_puppet else 'disabled'}")
 
+    def _v3_status(self, name: str, enabled: bool, caps: list) -> str:
+        state = "enabled" if enabled else "disabled"
+        if enabled and self.conn is not None and self.conn.connected:
+            missing = [c for c in caps if c not in self.caps_enabled]
+            state += " (active)" if not missing else f" (not negotiated: {', '.join(missing)}, RECONNECT to apply)"
+        return f"{name} is {state}"
+
+    async def cmd_backfill(self, args) -> None:
+        if args.max is not None:
+            self.backfill_max = max(1, min(args.max, 1000))
+        if args.max_age is not None:
+            self.backfill_max_age = max(1, args.max_age)
+        if args.enabled is not None:
+            self.backfill = args.enabled
+        if args.enabled is not None or args.max is not None or args.max_age is not None:
+            await self.save()
+
+        self.send_notice(
+            self._v3_status("Backfill", self.backfill, ["server-time", "batch", "draft/chathistory"])
+            + f", max {self.backfill_max} messages / {self.backfill_max_age} h per channel and connect"
+        )
+
+    async def cmd_replies(self, args) -> None:
+        if args.enabled is not None:
+            self.replies = args.enabled
+            await self.save()
+
+        self.send_notice(self._v3_status("Replies and reactions", self.replies, ["message-tags"]))
+
+    async def cmd_echo(self, args) -> None:
+        if args.enabled is not None:
+            self.echo = args.enabled
+            await self.save()
+
+        self.send_notice(self._v3_status("Echo", self.echo, ["echo-message", "labeled-response"]))
+
+    async def cmd_filehost(self, args) -> None:
+        if args.enabled is not None:
+            self.filehost = args.enabled
+            await self.save()
+
+        state = self._v3_status("File host", self.filehost, ["batch", "draft/authtoken"])
+        url = self.v3.filehost_url
+        self.send_notice(state + (f", server offers {url}" if url else ""))
+
     async def cmd_rejoin(self, args) -> None:
         if args.invite is not None:
             self.rejoin_invite = args.invite
@@ -1450,8 +1574,12 @@ class NetworkRoom(Room):
                 self.disconnect = False
                 self.connected_at = asyncio.get_running_loop().time()
 
+                # IRCv3 features, all inert unless enabled per network
+                self.v3.reset_connection()
+                self.v3.register(self.conn)
+
                 # request CAPs
-                caps_req = list(self.caps)
+                caps_req = list(dict.fromkeys(list(self.caps) + self.v3.wanted_caps()))
                 if sasl_mechanism in ["plain", "external"]:
                     caps_req += ["sasl"]
 

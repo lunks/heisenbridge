@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 from abc import ABC
@@ -13,6 +14,8 @@ from mautrix.types.event.type import EventType
 
 from heisenbridge.appservice import AppService
 from heisenbridge.event_queue import EventQueue
+from heisenbridge.ircv3 import MsgIndex
+from heisenbridge.ircv3 import MsgMeta
 from heisenbridge.parser import IRCMatrixParser
 
 
@@ -57,6 +60,14 @@ class Room(ABC):
         self.hidden_room_id = None
         self.displaynames = {}
         self.last_messages = defaultdict(str)
+
+        # IRCv3 state: msgid <-> event id, last seen message (msgid, unix ms), backfill bookkeeping
+        self.index = MsgIndex()
+        self.irc_cursor = None
+        self.backfilling = False
+        self.backfill_conn_id = None
+        self.held = []
+        self._save_handle = None
         self.parser = IRCMatrixParser(self.displaynames)
 
         self._mx_handlers = {}
@@ -98,6 +109,44 @@ class Room(ABC):
         config["type"] = type(self).__name__
         config["user_id"] = self.user_id
         await self.az.intent.set_account_data("irc", config, self.id)
+
+    # persist soon, coalescing bursts (message ids change on every IRC message)
+    def mark_dirty(self, delay: float = 2.0) -> None:
+        if self._save_handle is not None or not self.id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._save_handle = loop.call_later(delay, lambda: asyncio.ensure_future(self.save_now()))
+
+    async def save_now(self) -> None:
+        if self._save_handle is not None:
+            self._save_handle.cancel()
+        self._save_handle = None
+        try:
+            await self.save()
+        except Exception:
+            logging.exception(f"Saving room {self.id} failed")
+
+    def v3_to_config(self) -> dict:
+        data = {}
+        if self.irc_cursor:
+            data["cursor"] = list(self.irc_cursor)
+        pairs = self.index.dump()
+        if pairs:
+            data["map"] = pairs
+        return {"irc_v3": data} if data else {}
+
+    def v3_from_config(self, config: dict) -> None:
+        data = config.get("irc_v3")
+        if not isinstance(data, dict):
+            return
+        cursor = data.get("cursor")
+        if isinstance(cursor, (list, tuple)) and len(cursor) == 2:
+            self.irc_cursor = (cursor[0], int(cursor[1]))
+            self.index.add_seen(cursor[0])
+        self.index.load(data.get("map"))
 
     def mx_register(self, type: str, func: Callable[[dict], bool]) -> None:
         if type not in self._mx_handlers:
@@ -266,6 +315,9 @@ class Room(ABC):
                         await self.serv.ensure_irc_user_id(self.network.name, self.lazy_members[event["user_id"]])
                         await self._join(event["user_id"], self.lazy_members[event["user_id"]])
 
+                    if event.get("drop_absent") and event["user_id"] not in self.members:
+                        continue
+
                     # if we get an event from unknown user (outside room for some reason) we may have a fallback
                     if event["user_id"] is not None and event["user_id"] not in self.members:
                         if "fallback_html" in event and event["fallback_html"] is not None:
@@ -288,7 +340,18 @@ class Room(ABC):
 
                     intent = self.az.intent.user(event["user_id"]) if event["user_id"] else self.az.intent
                     type = EventType.find(event["type"])
-                    await intent.send_message_event(self.id, type, event["content"])
+                    meta = event.get("meta")
+                    kwargs = {}
+                    if meta is not None:
+                        if meta.ts:
+                            kwargs["timestamp"] = meta.ts
+                        reply_to = self.index.event_for(meta.reply)
+                        if reply_to and event["type"] == "m.room.message":
+                            event["content"]["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
+                    event_id = await intent.send_message_event(self.id, type, event["content"], **kwargs)
+                    if meta is not None and meta.msgid and event["type"] == "m.room.message":
+                        self.index.link(meta.msgid, str(event_id))
+                        self.mark_dirty()
             except Exception:
                 logging.exception("Queued event failed")
 
@@ -300,6 +363,7 @@ class Room(ABC):
         formatted=None,
         fallback_html: Optional[str] = None,
         double_puppet: bool = False,
+        meta: Optional[MsgMeta] = None,
     ) -> None:
         if formatted:
             event = {
@@ -327,6 +391,9 @@ class Room(ABC):
         if double_puppet:
             event["content"][DOUBLE_PUPPET_KEY] = True
 
+        if meta is not None and meta.keep_separate():
+            event["meta"] = meta
+
         self._queue.enqueue(event)
 
     # send emote to mx user (may be puppeted)
@@ -336,6 +403,7 @@ class Room(ABC):
         user_id: Optional[str] = None,
         fallback_html: Optional[str] = None,
         double_puppet: bool = False,
+        meta: Optional[MsgMeta] = None,
     ) -> None:
         event = {
             "type": "m.room.message",
@@ -350,6 +418,9 @@ class Room(ABC):
         if double_puppet:
             event["content"][DOUBLE_PUPPET_KEY] = True
 
+        if meta is not None and meta.keep_separate():
+            event["meta"] = meta
+
         self._queue.enqueue(event)
 
     # send notice to mx user (may be puppeted)
@@ -360,6 +431,7 @@ class Room(ABC):
         formatted=None,
         fallback_html: Optional[str] = None,
         double_puppet: bool = False,
+        meta: Optional[MsgMeta] = None,
     ) -> None:
         if formatted:
             event = {
@@ -386,6 +458,9 @@ class Room(ABC):
 
         if double_puppet:
             event["content"][DOUBLE_PUPPET_KEY] = True
+
+        if meta is not None and meta.keep_separate():
+            event["meta"] = meta
 
         self._queue.enqueue(event)
 

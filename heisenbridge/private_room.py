@@ -26,6 +26,8 @@ from mautrix.types.event.type import EventType
 from heisenbridge.command_parse import CommandManager
 from heisenbridge.command_parse import CommandParser
 from heisenbridge.command_parse import CommandParserError
+from heisenbridge.ircv3 import event_meta
+from heisenbridge.room import DOUBLE_PUPPET_KEY
 from heisenbridge.room import Room
 
 
@@ -376,6 +378,10 @@ class PrivateRoom(Room):
     force_forward = False
     prefix_all = False
     allow_double_puppet = True
+    # IRCv3 features (server-time, replies, reactions, echo) apply to this room
+    allow_v3 = True
+    # catch up from IRC chat history after reconnecting
+    allow_backfill = False
 
     commands: CommandManager
 
@@ -421,8 +427,11 @@ class PrivateRoom(Room):
         cmd.set_defaults(enabled=None)
         self.commands.register(cmd, self.cmd_prefix_all)
 
+        self.sent_reactions = {}
+
         self.mx_register("m.room.message", self.on_mx_message)
         self.mx_register("m.room.redaction", self.on_mx_redaction)
+        self.mx_register("m.reaction", self.on_mx_reaction)
 
     def from_config(self, config: dict) -> None:
         if "max_lines" in config:
@@ -436,6 +445,8 @@ class PrivateRoom(Room):
 
         if "prefix_all" in config:
             self.prefix_all = config["prefix_all"]
+
+        self.v3_from_config(config)
 
         if "name" not in config:
             raise Exception("No name key in config for ChatRoom")
@@ -464,6 +475,7 @@ class PrivateRoom(Room):
             "use_pastebin": self.use_pastebin,
             "use_reacts": self.use_reacts,
             "prefix_all": self.prefix_all,
+            **self.v3_to_config(),
         }
 
     @staticmethod
@@ -551,6 +563,7 @@ class PrivateRoom(Room):
         fallback_html: Optional[str] = None,
         forward=False,
         double_puppet: bool = False,
+        meta=None,
     ):
         if (self.force_forward or forward or self.network.forward) and user_id is None:
             self.network.send_notice(text=f"{self.name}: {text}", formatted=formatted, fallback_html=fallback_html)
@@ -561,6 +574,7 @@ class PrivateRoom(Room):
                 formatted=formatted,
                 fallback_html=fallback_html,
                 double_puppet=double_puppet,
+                meta=meta,
             )
 
     def can_double_puppet(self) -> bool:
@@ -612,6 +626,7 @@ class PrivateRoom(Room):
         irc_user_id = self.serv.irc_user_id(self.network.name, event.source.nick)
 
         (plain, formatted) = parse_irc_formatting(event.arguments[0], self.pills(), self.network.color)
+        meta = event_meta(event)
 
         # ignore relaymsgs by us
         if event.tags:
@@ -621,7 +636,7 @@ class PrivateRoom(Room):
 
         if event.source.nick == self.network.conn.real_nickname:
             if self.can_double_puppet():
-                self.send_message(plain, self.user_id, formatted=formatted, double_puppet=True)
+                self.send_message(plain, self.user_id, formatted=formatted, double_puppet=True, meta=meta)
                 return
 
             source_irc_user_id = self.serv.irc_user_id(self.network.name, event.source.nick)
@@ -655,6 +670,7 @@ class PrivateRoom(Room):
             irc_user_id,
             formatted=formatted,
             fallback_html=f"<b>Message from {str(event.source)}</b>: {html.escape(plain)}",
+            meta=meta,
         )
 
         # lazy update displayname if we detect a change
@@ -670,10 +686,11 @@ class PrivateRoom(Room):
             return
 
         (plain, formatted) = parse_irc_formatting(event.arguments[0])
+        meta = event_meta(event)
 
         if event.source.nick == self.network.conn.real_nickname:
             if self.can_double_puppet():
-                self.send_notice(plain, self.user_id, formatted=formatted, double_puppet=True)
+                self.send_notice(plain, self.user_id, formatted=formatted, double_puppet=True, meta=meta)
                 return
 
             self.send_notice(f"You noticed: {plain}", formatted=(f"You noticed: {formatted}" if formatted else None))
@@ -693,6 +710,7 @@ class PrivateRoom(Room):
             irc_user_id,
             formatted=formatted,
             fallback_html=f"<b>Notice from {str(event.source)}</b>: {formatted if formatted else html.escape(plain)}",
+            meta=meta,
         )
 
     def on_ctcp(self, conn, event) -> None:
@@ -711,16 +729,20 @@ class PrivateRoom(Room):
 
         if command == "ACTION" and len(event.arguments) > 1:
             (plain, formatted) = parse_irc_formatting(event.arguments[1])
+            meta = event_meta(event)
 
             if event.source.nick == self.network.conn.real_nickname:
                 if self.can_double_puppet():
-                    self.send_emote(plain, self.user_id, double_puppet=True)
+                    self.send_emote(plain, self.user_id, double_puppet=True, meta=meta)
                 else:
                     self.send_emote(f"(you) {plain}")
                 return
 
             self.send_emote(
-                plain, irc_user_id, fallback_html=f"<b>Emote from {str(event.source)}</b>: {html.escape(plain)}"
+                plain,
+                irc_user_id,
+                fallback_html=f"<b>Emote from {str(event.source)}</b>: {html.escape(plain)}",
+                meta=meta,
             )
         else:
             (plain, formatted) = parse_irc_formatting(" ".join(event.arguments))
@@ -732,6 +754,47 @@ class PrivateRoom(Room):
 
         (plain, formatted) = parse_irc_formatting(" ".join(event.arguments))
         self.send_notice_html(f"<b>{str(event.source)}</b> sent <b>CTCP REPLY {html.escape(plain)}</b> (ignored)")
+
+    def on_tagmsg(self, conn, event) -> None:
+        # IRCv3 reactions, everything else (typing and so on) is ignored
+        if self.network is None or not self.network.replies:
+            return
+
+        meta = event_meta(event)
+        if meta is None or not meta.react or not meta.reply:
+            return
+
+        target_event = self.index.event_for(meta.reply)
+        if not target_event:
+            return
+
+        content = {
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": target_event,
+                "key": meta.react,
+            }
+        }
+
+        if event.source.nick == conn.real_nickname:
+            if not self.can_double_puppet():
+                return
+            user_id = self.user_id
+            content[DOUBLE_PUPPET_KEY] = True
+        else:
+            user_id = self.serv.irc_user_id(self.network.name, event.source.nick)
+            if self.lazy_members is not None and user_id not in self.members:
+                self.lazy_members[user_id] = event.source.nick
+
+        self._queue.enqueue(
+            {
+                "type": "m.reaction",
+                "content": content,
+                "user_id": user_id,
+                "fallback_html": None,
+                "drop_absent": True,
+            }
+        )
 
     async def _process_event_content(self, event, prefix, reply_to=None):
         content = event.content
@@ -777,6 +840,19 @@ class PrivateRoom(Room):
             )
 
         return messages
+
+    def _irc_emit(self, func, message, event, first: bool) -> None:
+        """Send one line to IRC, with reply and label tags when the IRCv3 features are on."""
+        v3 = getattr(self.network, "v3", None)
+        kind = getattr(func, "__name__", "")
+        if v3 is not None and self.allow_v3 and kind in ("privmsg", "action") and v3.tags_active():
+            tags = v3.outgoing_tags(self, event, first)
+            if tags:
+                text = message if kind == "privmsg" else f"\001ACTION {message}\001"
+                self.network.conn.send_tagged(tags, "PRIVMSG", self.name, ":" + text)
+                return
+
+        func(self.name, message)
 
     async def _send_message(self, event, func, prefix=""):
         # try to find out if this was a reply
@@ -863,7 +939,7 @@ class PrivateRoom(Room):
 
                 return
 
-            func(self.name, message)
+            self._irc_emit(func, message, event, i == 0)
 
         # show number of lines sent to IRC
         if self.use_reacts and self.max_lines == 0 and len(messages) > 1:
@@ -880,7 +956,13 @@ class PrivateRoom(Room):
         if str(event.content.msgtype) == "m.emote":
             await self._send_message(event, self.network.conn.action)
         elif str(event.content.msgtype) in ["m.image", "m.file", "m.audio", "m.video"]:
-            if event.content.filename and event.content.filename != event.content.body:
+            url = await self._upload_to_filehost(event)
+            if url:
+                if event.content.filename and event.content.filename != event.content.body:
+                    new_body = url + "\n" + event.content.body
+                else:
+                    new_body = url
+            elif event.content.filename and event.content.filename != event.content.body:
                 new_body = self.serv.mxc_to_url(event.content.url, event.content.filename) + "\n" + event.content.body
             else:
                 new_body = self.serv.mxc_to_url(event.content.url, event.content.body)
@@ -912,7 +994,68 @@ class PrivateRoom(Room):
 
         await self.az.intent.send_receipt(event.room_id, event.event_id)
 
+    FILEHOST_MAX_BYTES = 25 * 1024 * 1024
+
+    async def _upload_to_filehost(self, event) -> Optional[str]:
+        """Upload Matrix media to the network's IRC file host, None means fall back to the Matrix link."""
+        v3 = getattr(self.network, "v3", None)
+        if v3 is None or not self.allow_v3 or not v3.filehost_active or not event.content.url:
+            return None
+
+        try:
+            info = event.content.info
+            size = getattr(info, "size", None) if info else None
+            if size and size > self.FILEHOST_MAX_BYTES:
+                return None
+            data = await self.az.intent.download_media(event.content.url)
+            if len(data) > self.FILEHOST_MAX_BYTES:
+                return None
+            filename = event.content.filename or event.content.body or "file"
+            filename = re.sub(r"[^\w.\-]+", "_", filename.split("/")[-1])[:100] or "file"
+            mimetype = getattr(info, "mimetype", None) if info else None
+            return await v3.filehost_upload(data, filename, mimetype)
+        except Exception:
+            logging.exception("Filehost upload failed, falling back to the Matrix link")
+            return None
+
+    async def on_mx_reaction(self, event) -> None:
+        if event.sender != self.user_id or self.network is None or not self.network.replies:
+            return
+
+        v3 = getattr(self.network, "v3", None)
+        conn = self.network.conn
+        if v3 is None or not self.allow_v3 or not v3.replies_active or conn is None or not conn.connected:
+            return
+
+        relates = event.content.relates_to
+        key = getattr(relates, "key", None)
+        msgid = self.index.msgid_for(str(relates.event_id)) if relates else None
+        # without a known msgid there is nothing to react to on IRC
+        if not key or not msgid:
+            return
+
+        tags = {"+draft/react": key, "+draft/reply": msgid}
+        if v3.echo_active:
+            tags["label"] = v3.register_label(None)
+        conn.send_tagged(tags, "TAGMSG", self.name)
+
+        self.sent_reactions[str(event.event_id)] = (msgid, key)
+        while len(self.sent_reactions) > 200:
+            del self.sent_reactions[next(iter(self.sent_reactions))]
+
     async def on_mx_redaction(self, event) -> None:
+        # a withdrawn reaction we relayed
+        if str(event.redacts) in self.sent_reactions:
+            msgid, key = self.sent_reactions.pop(str(event.redacts))
+            v3 = getattr(self.network, "v3", None)
+            conn = self.network.conn if self.network else None
+            if v3 is not None and v3.replies_active and conn is not None and conn.connected:
+                tags = {"+draft/unreact": key, "+draft/reply": msgid}
+                if v3.echo_active:
+                    tags["label"] = v3.register_label(None)
+                conn.send_tagged(tags, "TAGMSG", self.name)
+            return
+
         for media in self.media:
             if media[0] == event.redacts:
                 url = urlparse(media[1])

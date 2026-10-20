@@ -25,6 +25,8 @@ class ChannelRoom(PrivateRoom):
     bans_buffer: List[str]
     on_channel: List[str]
 
+    allow_backfill = True
+
     def init(self) -> None:
         super().init()
 
@@ -441,6 +443,10 @@ class ChannelRoom(PrivateRoom):
 
         # trust the names reply is always up-to-date
         self.on_channel = on_channel
+
+        # catch up on what was said while the bridge was away, once per connection
+        if self.network.backfill:
+            self.network.v3.start_backfill(self)
 
     def is_on_channel(self, nick):
         return nick.lower() in self.on_channel
